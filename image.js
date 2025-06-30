@@ -44,12 +44,7 @@ fn fragmentMain(fragData: DataStruct) -> @location(0) vec4f {
 
 /** @type {import("npm:@anywidget/types").Render} */
 async function render({ model, el }) {
-	let { image_bytes, image_width, image_height, width, height } = model.get(
-		"_options",
-	);
-
-	let image_array = new Uint8ClampedArray(image_bytes.buffer)
-	let image_data = new ImageData(image_array, image_width, image_height);
+	let { image_width, image_height, width, height } = model.get("_options");
 
 	// create render context
 	let { device, context } = await get_render_context({ el, width, height });
@@ -83,12 +78,8 @@ async function render({ model, el }) {
 		],
 	};
 
-	// Create ImageBitmap from image file
-	// const response = await fetch("parrot.jpg");
-	// const imageBitmap = await createImageBitmap(await response.blob());
-
-	// Create texture object
-	const texture = device.createTexture({
+	// Create texture object (will be reused for updates)
+	let texture = device.createTexture({
 		size: [image_width, image_height, 1],
 		format: "rgba8unorm",
 		usage:
@@ -96,13 +87,6 @@ async function render({ model, el }) {
 			GPUTextureUsage.COPY_DST |
 			GPUTextureUsage.RENDER_ATTACHMENT
 	});
-
-	// Write data to texture
-	device.queue.copyExternalImageToTexture(
-		{ source: image_data },
-		{ texture: texture },
-		[image_width, image_height]
-	);
 
 	// Create sampler
 	const sampler = device.createSampler({
@@ -139,53 +123,89 @@ async function render({ model, el }) {
 	// Access the bind group layout
 	const bindGroupLayout = renderPipeline.getBindGroupLayout(0);
 
-	// Create the bind group
-	let bindGroup = device.createBindGroup({
-		layout: bindGroupLayout,
-		entries: [{
-			binding: 0,
-			resource: sampler
-		},
-		{
-			binding: 1,
-			resource: texture.createView({
-				dimension: "2d",
-			})
-	   }]
+	// Create the bind group (will be recreated when texture updates)
+	let bindGroup;
+
+	function createBindGroup() {
+		bindGroup = device.createBindGroup({
+			layout: bindGroupLayout,
+			entries: [{
+				binding: 0,
+				resource: sampler
+			},
+			{
+				binding: 1,
+				resource: texture.createView({
+					dimension: "2d",
+				})
+			}]
+		});
+	}
+
+	// Function to update texture with new image data
+	function updateTexture() {
+		const image_bytes = model.get("texture_data");
+		if (!image_bytes) return;
+
+		const image_array = new Uint8ClampedArray(image_bytes.buffer || image_bytes);
+		const image_data = new ImageData(image_array, image_width, image_height);
+
+		// Write data to texture
+		device.queue.copyExternalImageToTexture(
+			{ source: image_data },
+			{ texture: texture },
+			[image_width, image_height]
+		);
+	}
+
+	// Initial texture setup
+	updateTexture();
+	createBindGroup();
+
+	// Animation frame handler
+	let animationId;
+	function newFrame(currentTime) {
+		// Create the command encoder and the render pass encoder
+		const encoder = device.createCommandEncoder();
+		const renderPass = encoder.beginRenderPass({
+			colorAttachments: [{
+				view: context.getCurrentTexture().createView(),
+				loadOp: "clear",
+				clearValue: { r: 0.9, g: 0.9, b: 0.9, a: 1.0 },
+				storeOp: "store"
+			}]
+		});
+
+		// Set the vertex buffer and pipeline
+		renderPass.setVertexBuffer(0, vertexBuffer);
+		renderPass.setPipeline(renderPipeline);
+
+		// Associate bind group with render pass encoder
+		renderPass.setBindGroup(0, bindGroup);
+
+		// Draw vertices
+		renderPass.draw(4);
+		renderPass.end();
+
+		// Submit the render commands to the GPU
+		device.queue.submit([encoder.finish()]);
+		animationId = window.requestAnimationFrame(newFrame);
+	}
+
+	// Start animation
+	animationId = window.requestAnimationFrame(newFrame);
+
+	// Listen for texture_data changes from Python
+	model.on("change:texture_data", () => {
+		updateTexture();
+		// No need to recreate bind group since we're updating the same texture
 	});
 
-	// Called just before the window is repainted
-	function newFrame(currentTime) {
-			// Create the command encoder and the render pass encoder
-			const encoder = device.createCommandEncoder();
-			const renderPass = encoder.beginRenderPass({
-				colorAttachments: [{
-					view: context.getCurrentTexture().createView(),
-					loadOp: "clear",
-					clearValue: { r: 0.9, g: 0.9, b: 0.9, a: 1.0 },
-					storeOp: "store"
-				}]
-			});
-
-			// Set the vertex buffer and pipeline
-			renderPass.setVertexBuffer(0, vertexBuffer);
-			renderPass.setPipeline(renderPipeline);
-
-			// Associate bind group with render pass encoder
-			renderPass.setBindGroup(0, bindGroup);
-
-			// Draw vertices
-			renderPass.draw(4);
-			renderPass.end();
-
-			// Submit the render commands to the GPU
-			device.queue.submit([encoder.finish()]);
-			window.requestAnimationFrame(newFrame);
-		}
-
-		window.requestAnimationFrame(newFrame);
-
+	// Cleanup function
 	return () => {
+		if (animationId) {
+			window.cancelAnimationFrame(animationId);
+		}
 		device.destroy();
 	};
 }
